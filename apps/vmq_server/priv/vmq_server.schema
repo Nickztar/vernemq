@@ -2327,8 +2327,9 @@
                                                          hidden
                                                         ]}.
 
-%% @doc Seconds after this node started before it publishes the replicated
-%% wills (replicate_lwt) of its previous incarnation, if it was restarted
+%% @doc Seconds before replicated wills (replicate_lwt) are published: after
+%% a peer stopped answering (lwt_fire_on_node_down), and after this node
+%% started, for the wills of its previous incarnation if it was restarted
 %% under the same name. Clients that reconnected by then get none. The
 %% default is the time an MQTT client with a 30 s keepalive gets before its
 %% will is published.
@@ -2337,6 +2338,36 @@
                                                            {datatype, integer},
                                                            hidden
                                                           ]}.
+
+%% @doc Publish the replicated wills (see replicate_lwt) of a cluster node
+%% that has died, lwt_fire_delay seconds after it stopped answering, instead
+%% of waiting for `cluster leave`. A peer that stops answering is probed
+%% directly, so that a netsplit, where its clients are still connected, never
+%% fires their wills.
+{mapping, "lwt_fire_on_node_down", "vmq_server.lwt_fire_on_node_down", [
+                                                                         {default, off},
+                                                                         {datatype, flag},
+                                                                         hidden
+                                                                        ]}.
+
+%% @doc Seconds a peer whose host does not answer at all must stay that way,
+%% without interruption, before it counts as dead (lwt_fire_on_node_down).
+{mapping, "lwt_unreachable_confirm", "vmq_server.lwt_unreachable_confirm", [
+                                                                             {default, 30},
+                                                                             {datatype, integer},
+                                                                             hidden
+                                                                            ]}.
+
+%% @doc host:port that this node must still reach to declare a peer dead
+%% when the peer does not answer at all; otherwise this node might be the
+%% isolated one (lwt_fire_on_node_down). Defaults to the Kubernetes API
+%% service when running in a pod. Without a witness, such a peer is never
+%% declared dead.
+{mapping, "lwt_witness", "vmq_server.lwt_witness", [
+                                                     {default, ""},
+                                                     {datatype, string},
+                                                     hidden
+                                                    ]}.
 
 %% @doc plugins.<plugin> enables/disables a plugin.
 %%

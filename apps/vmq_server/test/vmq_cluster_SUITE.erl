@@ -91,6 +91,11 @@ all() ->
      replicated_lwt_dead_node_test,
      replicated_lwt_cluster_leave_test,
      replicated_lwt_restart_test,
+     lwt_watch_dead_node_test,
+     lwt_watch_netsplit_test,
+     lwt_watch_restart_test,
+     lwt_watch_decide_test,
+     lwt_watch_verdict_test,
      shared_subs_random_policy_test,
      shared_subs_prefer_local_policy_test,
      shared_subs_prefer_local_ignores_stale_local_subscribers,
@@ -695,6 +700,113 @@ replicated_lwt_restart_test(Config) ->
     {error, timeout} = gen_tcp:recv(Sub, 0, 3000),
     ok = wait_until_converged(RestNodes, fun lwt_entries/1, 1).
 
+%% With lwt_fire_on_node_down, a node that halts gets its wills published by a
+%% survivor after lwt_fire_delay, except for clients that reconnected by then.
+lwt_watch_dead_node_test(Config) ->
+    {Sub, [{_, DeadNode, DeadPort}, _, {_, _, OtherPort}] = Nodes} = lwt_watch_setup(Config),
+    _ = lwt_connect(DeadPort, "lwt-back", lwt_will("lwt/back")),
+    ok = wait_until_converged(Nodes, fun lwt_entries/1, 2),
+    T0 = erlang:monotonic_time(millisecond),
+    rpc:cast(DeadNode, erlang, halt, []),
+    ok = vmq_cluster_test_utils:wait_until(
+        fun() -> ok == lwt_connect(OtherPort, "lwt-back", [{clean_session, false}]) end, 20, 200
+    ),
+    ok = packet:expect_packet(Sub, "publish", packet:gen_publish(<<"lwt/gone">>, 0, <<"dead">>, [])),
+    Elapsed = erlang:monotonic_time(millisecond) - T0,
+    ct:pal("halt -> will: ~p ms", [Elapsed]),
+    true = Elapsed >= 5000,
+    {error, timeout} = gen_tcp:recv(Sub, 0, 3000),
+    {_, RestNodes} = lists:split(1, Nodes),
+    ok = wait_until_converged(RestNodes, fun lwt_entries/1, 0).
+
+%% A netsplit (the peer is running, only distribution is cut) fires nothing.
+lwt_watch_netsplit_test(Config) ->
+    {Sub, [{_, SplitNode, _} | RestNodes] = Nodes} = lwt_watch_setup(Config),
+    {_, RestNames, _} = lists:unzip3(RestNodes),
+    ok = vmq_cluster_test_utils:partition_cluster([SplitNode], RestNames),
+    %% lwt_fire_delay is 5 s; give it twice that.
+    {error, timeout} = gen_tcp:recv(Sub, 0, 10000),
+    ok = vmq_cluster_test_utils:heal_cluster([SplitNode], RestNames),
+    ok = wait_until_converged(Nodes, fun lwt_entries/1, 1).
+
+%% A node that crashes and comes back under the same name before its peers
+%% fire publishes its previous incarnation's wills itself, but keeps the will
+%% of a client that has already reconnected to it.
+lwt_watch_restart_test(Config) ->
+    {Sub, [{_, Node, Port} | RestNodes] = Nodes} = lwt_watch_setup(Config),
+    set_config(RestNodes, lwt_fire_delay, 120),
+    _ = lwt_connect(Port, "lwt-back", lwt_will("lwt/back")),
+    ok = wait_until_converged(Nodes, fun lwt_entries/1, 2),
+    rpc:cast(Node, erlang, halt, []),
+    ok = vmq_cluster_test_utils:wait_until_offline(Node),
+    {ok, Peer, Node} = vmq_cluster_test_utils:start_node(Node, Config, ?FUNCTION_NAME),
+    Restarted = [{Peer, Node, Port}],
+    {ok, _} = rpc:call(Node, vmq_server_cmd, listener_start, [Port, []]),
+    ok = rpc:call(Node, vmq_auth, register_hooks, []),
+    ok = vmq_cluster_test_utils:refresh_plugin_hooks(Restarted),
+    lwt_watch_config(Restarted),
+    %% enough time for lwt-back to reconnect first
+    set_config(Restarted, lwt_fire_delay, 10),
+    ok = vmq_cluster_test_utils:wait_until(
+        fun() -> ok == lwt_connect(Port, "lwt-back", lwt_will("lwt/back")) end, 20, 200
+    ),
+    ok = packet:expect_packet(Sub, "publish", packet:gen_publish(<<"lwt/gone">>, 0, <<"dead">>, [])),
+    {error, timeout} = gen_tcp:recv(Sub, 0, 3000),
+    ok = wait_until_converged(RestNodes, fun lwt_entries/1, 1).
+
+lwt_watch_decide_test(_Config) ->
+    Opts = #{delay => 45000, confirm => 30000},
+    %% Rounds once a second; returns the time of the first fire, or none.
+    FirstFire = fun(Verdicts) ->
+        {_, Fired} = lists:foldl(
+            fun({T, V}, {P, F}) ->
+                case vmq_lwt_watch:decide(P, V, T * 1000, Opts) of
+                    {fire, P1} when F == none -> {P1, T};
+                    {fire, _} -> error(fired_twice);
+                    {wait, P1} -> {P1, F}
+                end
+            end,
+            {undefined, none},
+            Verdicts
+        ),
+        Fired
+    end,
+    Seq = fun(From, To, V) -> [{T, V} || T <- lists:seq(From, To)] end,
+    %% host up, VerneMQ gone: at the delay
+    45 = FirstFire(Seq(0, 90, dead)),
+    %% host gone: at the delay, unreachable for 30 s by then
+    45 = FirstFire(Seq(0, 90, unreachable)),
+    %% one answer from the host restarts the 30 s
+    51 = FirstFire(Seq(0, 19, unreachable) ++ [{20, netsplit}] ++ Seq(21, 90, unreachable)),
+    %% unreachable only from 40 s on: 30 s later
+    70 = FirstFire(Seq(0, 39, netsplit) ++ Seq(40, 90, unreachable)),
+    %% a single refused probe is not enough
+    none = FirstFire([{T, case T rem 2 of 0 -> dead; 1 -> netsplit end} || T <- lists:seq(0, 90)]),
+    %% netsplit, or we are the isolated one: never
+    none = FirstFire(Seq(0, 90, netsplit)),
+    none = FirstFire(Seq(0, 90, isolated)).
+
+lwt_watch_verdict_test(_Config) ->
+    Up = fun() -> true end,
+    Down = fun() -> false end,
+    dead = vmq_lwt_watch:verdict(refused, Down),
+    dead = vmq_lwt_watch:verdict(noport, Down),
+    netsplit = vmq_lwt_watch:verdict(listening, Up),
+    unreachable = vmq_lwt_watch:verdict(unreachable, Up),
+    isolated = vmq_lwt_watch:verdict(unreachable, Down),
+    %% epmd answers, but has no such node
+    noport = vmq_lwt_watch:probe('nobody@127.0.0.1'),
+    %% a running node's distribution port accepts
+    listening = vmq_lwt_watch:probe(node()),
+    %% nothing answers (TEST-NET-1, RFC 5737)
+    unreachable = vmq_lwt_watch:probe('nobody@192.0.2.1'),
+    %% an epmd that accepts but doesn't answer (an overloaded host) is no
+    %% proof that VerneMQ is gone
+    {ok, Busy} = gen_tcp:listen(0, [binary, {active, false}]),
+    {ok, BusyPort} = inet:port(Busy),
+    unreachable = vmq_lwt_watch:probe('nobody@127.0.0.1', BusyPort),
+    ok = gen_tcp:close(Busy).
+
 %% One client with a will on the first node, one that disconnected normally.
 lwt_setup(Config) ->
     ok = ensure_cluster(Config),
@@ -712,6 +824,16 @@ lwt_setup(Config) ->
 lwt_config(Nodes) ->
     set_config(Nodes, replicate_lwt, true),
     set_config(Nodes, lwt_fire_delay, 5).
+
+lwt_watch_setup(Config) ->
+    {Sub, Nodes} = lwt_setup(Config),
+    lwt_watch_config(Nodes),
+    {Sub, Nodes}.
+
+lwt_watch_config(Nodes) ->
+    lwt_config(Nodes),
+    set_config(Nodes, lwt_fire_on_node_down, true),
+    set_config(Nodes, lwt_unreachable_confirm, 3).
 
 lwt_will(Topic) ->
     [{clean_session, false}, {will_topic, Topic}, {will_msg, <<"dead">>}].
