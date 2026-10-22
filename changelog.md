@@ -1,4 +1,6 @@
 - Bugfix: Refuse the CONNECT of a client whose old node is still connected but no longer answers, instead of completing the registration once that node is declared down, which took over the client's newer session.
+- Feature: Optionally publish the replicated wills of a dead cluster node automatically (`lwt_fire_on_node_down`). A peer that stops answering is probed directly, so that a netsplit does not fire the wills of clients that are still connected.
+- Feature: Optional replication of last wills (`replicate_lwt`). The wills of a node that dies without shutting down are published by `vmq-admin cluster leave` of that node, or by the node itself when it is restarted under the same name (after `lwt_fire_delay`).
 - Bugfix: Don't drop the first CONNECT of a client with a persistent session that reconnects to another node after the node holding its session went down.
 - Spec compliance: preserve the retain-as-published flag for persisted offline messages delivered after MQTT 5 session reconnects.
 - Spec compliance: deliver MQTT 5 last will messages when clients send DISCONNECT packets with invalid reason codes.
